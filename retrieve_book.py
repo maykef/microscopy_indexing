@@ -1,18 +1,43 @@
 #!/usr/bin/env python3
+"""
+RAG Book Retrieval with Qwen 72B (GPTQ or bitsandbytes)
+Semantic search → Top pages → Qwen 72B reads & answers
+"""
+
+# Pillow compatibility fix (must be before other imports)
+from PIL import Image
+if not hasattr(Image, 'LANCZOS'):
+    # Pillow 10+ moved constants to Resampling enum
+    if hasattr(Image, 'Resampling'):
+        Image.LANCZOS = Image.Resampling.LANCZOS
+        Image.BILINEAR = Image.Resampling.BILINEAR
+        Image.BICUBIC = Image.Resampling.BICUBIC
+        Image.NEAREST = Image.Resampling.NEAREST
+        Image.BOX = Image.Resampling.BOX
+        Image.HAMMING = Image.Resampling.HAMMING
+
+import gc
 import json
+import logging
 import re
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 import torch
-from tqdm import tqdm
-from PIL import Image
+from transformers import AutoProcessor
 
-from colpali_engine.models import ColPali, ColPaliProcessor
+# Model class import
+try:
+    from transformers import AutoModelForImageTextToText as QwenModelClass
+except Exception:
+    from transformers import AutoModelForVision2Seq as QwenModelClass
 
-# ----------------------------
-# Paths (same cache layout as index_all.py)
-# ----------------------------
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 ROOT = Path("/app")
 CACHE = ROOT / "index_all_cache"
 
@@ -22,282 +47,589 @@ VIS_META = VISUAL_DIR / "visual_index_metadata.json"
 SEM_DIR = CACHE / "semantic"
 SEM_INDEX = SEM_DIR / "semantic_index.jsonl"
 
-COLPALI_MODEL = "vidore/colpali-v1.2"
+# Try GPTQ first (more efficient), fallback to bitsandbytes
+QWEN_72B_GPTQ = "Qwen/Qwen2-VL-72B-Instruct-GPTQ-Int8"
+QWEN_72B_BASE = "Qwen/Qwen2-VL-72B-Instruct"
+
+# RAG settings
+TOP_K_PAGES = 10
+MAX_CONTEXT_PAGES = 3  # Conservative: 3 pages = ~16k tokens (safe for 32k limit)
+MAX_NEW_TOKENS = 1000  # Reduced to save memory
 
 
-# ----------------------------
-# Small text helpers
-# ----------------------------
+# ============================================================
+# LOGGING
+# ============================================================
+
+def setup_logging(level: int = logging.INFO) -> logging.Logger:
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s | %(levelname)-8s | %(message)s',
+        datefmt='%H:%M:%S',
+        handlers=[logging.StreamHandler(sys.stdout)]
+    )
+    return logging.getLogger(__name__)
+
+
+logger = setup_logging()
+
+
+# ============================================================
+# INDEX VALIDATION
+# ============================================================
+
+def validate_index() -> Tuple[bool, List[str]]:
+    """Validate index exists and is readable."""
+    errors = []
+    
+    if not VIS_META.exists():
+        errors.append(f"Visual metadata missing: {VIS_META}")
+    if not SEM_INDEX.exists():
+        errors.append(f"Semantic index missing: {SEM_INDEX}")
+    
+    return (len(errors) == 0, errors)
+
+
+# ============================================================
+# TEXT UTILITIES
+# ============================================================
+
 def normalize_text(s: str) -> str:
+    """Normalize: lowercase, collapse whitespace."""
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 
 def tokenize_query(q: str) -> List[str]:
+    """Extract alphanumeric tokens 3+ chars."""
     q = normalize_text(q)
-    toks = re.findall(r"[a-z0-9]+", q)
-    return [t for t in toks if len(t) >= 3]
+    tokens = re.findall(r"[a-z0-9]+", q)
+    return [t for t in tokens if len(t) >= 3]
 
 
-# ----------------------------
-# Load metadata + embeddings
-# ----------------------------
-def load_visual_metadata_single_book() -> dict:
-    if not VIS_META.exists():
-        raise FileNotFoundError(f"Missing visual metadata: {VIS_META}")
+# ============================================================
+# METADATA
+# ============================================================
 
+def load_visual_metadata() -> dict:
+    """Load visual metadata for book."""
+    logger.info("Loading visual metadata...")
+    
     with open(VIS_META, "r", encoding="utf-8") as f:
         meta_all = json.load(f)
-
-    if not meta_all:
-        raise RuntimeError(f"Visual metadata file is empty: {VIS_META}")
-
-    if len(meta_all) != 1:
-        print(f"⚠️ Expected 1 book, found {len(meta_all)} entries in metadata. Using the first.")
 
     paper_id = next(iter(meta_all.keys()))
     meta = meta_all[paper_id]
     meta["paper_id"] = paper_id
+    
+    logger.info(f"  Book: {meta['pdf_filename']}")
+    logger.info(f"  Pages: {meta['page_count']}")
+    
     return meta
 
 
-def load_page_embeddings(emb_path: Path) -> torch.Tensor:
-    if not emb_path.exists():
-        raise FileNotFoundError(f"Missing ColPali embeddings: {emb_path}")
+# ============================================================
+# SEMANTIC SEARCH
+# ============================================================
 
-    page_embs = torch.load(emb_path, map_location="cpu")
-
-    # If older format stored a list of tensors, stack/concat safely
-    if isinstance(page_embs, list):
-        if len(page_embs) == 0:
-            raise RuntimeError(f"Embeddings file is empty list: {emb_path}")
-        page_embs = torch.cat(page_embs, dim=0)
-
-    return page_embs
-
-
-# ----------------------------
-# Semantic search over JSONL (cheap lexical-ish)
-# ----------------------------
-def semantic_search(query: str, jsonl_path: Path, top_k: int = 80) -> List[dict]:
-    """
-    Scores each page record by term overlap against:
-      - key_terms
-      - semantic_summary
-      - notable_claims
-    Returns top_k records with _semantic_score.
-    """
-    if not jsonl_path.exists():
-        raise FileNotFoundError(f"Missing semantic index: {jsonl_path}")
-
-    qnorm = normalize_text(query)
-    qtokens = set(tokenize_query(query))
-
-    scored = []
-    with open(jsonl_path, "r", encoding="utf-8") as f:
+def load_semantic_index(pdf_filename: str) -> List[dict]:
+    """Load semantic records for specific PDF."""
+    logger.info("Loading semantic index...")
+    
+    records = []
+    with open(SEM_INDEX, "r", encoding="utf-8") as f:
         for line in f:
-            line = line.strip()
-            if not line:
+            if not line.strip():
                 continue
             try:
                 rec = json.loads(line)
-            except Exception:
+                if rec.get("pdf_filename") == pdf_filename:
+                    records.append(rec)
+            except json.JSONDecodeError:
                 continue
+    
+    logger.info(f"  Loaded {len(records)} page records")
+    return records
 
-            kt = " ".join(rec.get("key_terms", []) or [])
-            summ = rec.get("semantic_summary", "") or ""
-            claims = " ".join(rec.get("notable_claims", []) or [])
-            blob = normalize_text(" ".join([kt, summ, claims]))
 
-            # Score: strong bonus for exact query substring + token overlap
-            exact = 1 if qnorm and len(qnorm) >= 4 and qnorm in blob else 0
-            btoks = set(re.findall(r"[a-z0-9]+", blob))
-            overlap = len(qtokens.intersection(btoks))
+def semantic_search(
+    query: str,
+    records: List[dict],
+    top_k: int = 50
+) -> List[dict]:
+    """
+    Enhanced semantic search with field weighting.
+    
+    Scoring:
+    - Exact phrase match in summary: +20 points
+    - Summary token overlap: +3 points each
+    - Key term overlap: +2 points each
+    - Claim overlap: +1 point each
+    """
+    qnorm = normalize_text(query)
+    qtokens = set(tokenize_query(query))
+    
+    if not qtokens:
+        return []
 
-            score = exact * 10 + overlap
-            if score > 0:
-                rec2 = dict(rec)
-                rec2["_semantic_score"] = float(score)
-                rec2["_semantic_exact"] = int(exact)
-                rec2["_semantic_overlap"] = int(overlap)
-                scored.append(rec2)
+    scored = []
+    
+    for rec in records:
+        # Extract fields
+        summary = normalize_text(rec.get("semantic_summary", ""))
+        terms = " ".join(rec.get("key_terms", []) or [])
+        claims = " ".join(rec.get("notable_claims", []) or [])
+        
+        terms_norm = normalize_text(terms)
+        claims_norm = normalize_text(claims)
+        
+        # Exact phrase match in summary (high value)
+        exact_in_summary = 20 if qnorm and len(qnorm) >= 4 and qnorm in summary else 0
+        
+        # Token overlaps with field weighting
+        summary_tokens = set(re.findall(r"[a-z0-9]+", summary))
+        terms_tokens = set(re.findall(r"[a-z0-9]+", terms_norm))
+        claims_tokens = set(re.findall(r"[a-z0-9]+", claims_norm))
+        
+        summary_overlap = len(qtokens & summary_tokens) * 3
+        terms_overlap = len(qtokens & terms_tokens) * 2
+        claims_overlap = len(qtokens & claims_tokens) * 1
+        
+        score = exact_in_summary + summary_overlap + terms_overlap + claims_overlap
+        
+        if score > 0:
+            rec2 = dict(rec)
+            rec2["_search_score"] = float(score)
+            rec2["_exact_match"] = int(exact_in_summary > 0)
+            rec2["_summary_overlap"] = summary_overlap // 3
+            rec2["_terms_overlap"] = terms_overlap // 2
+            scored.append(rec2)
 
-    scored.sort(key=lambda r: r["_semantic_score"], reverse=True)
+    scored.sort(key=lambda r: r["_search_score"], reverse=True)
+    
+    logger.info(f"  Semantic search: {len(scored)} hits for '{query}'")
+    
     return scored[:top_k]
 
 
-# ----------------------------
-# ColPali (used as reranker)
-# ----------------------------
-def load_colpali():
-    print("🚀 Loading ColPali...")
+# ============================================================
+# QWEN 72B LOADING
+# ============================================================
+
+def check_gptq_available() -> bool:
+    """Check if auto-gptq is installed."""
     try:
-        model = ColPali.from_pretrained(
-            COLPALI_MODEL,
-            dtype=torch.bfloat16,
-            device_map="cuda:0",
-            attn_implementation="flash_attention_2",
-            local_files_only=True
-        )
-        proc = ColPaliProcessor.from_pretrained(COLPALI_MODEL, local_files_only=True)
-        print("   ✅ Loaded from local cache")
-    except Exception:
-        model = ColPali.from_pretrained(
-            COLPALI_MODEL,
-            dtype=torch.bfloat16,
-            device_map="cuda:0",
-            attn_implementation="flash_attention_2"
-        )
-        proc = ColPaliProcessor.from_pretrained(COLPALI_MODEL)
-        print("   ✅ Downloaded and cached")
+        import auto_gptq
+        return True
+    except ImportError:
+        return False
+
+
+def load_qwen_72b_gptq() -> Tuple[any, AutoProcessor]:
+    """Load GPTQ quantized model (most efficient)."""
+    logger.info("Attempting to load GPTQ-Int8 model...")
+    
+    if not check_gptq_available():
+        raise ImportError("auto-gptq not installed. Install with: pip install auto-gptq")
+    
+    proc = AutoProcessor.from_pretrained(QWEN_72B_GPTQ)
+    
+    # GPTQ loading configuration
+    model = QwenModelClass.from_pretrained(
+        QWEN_72B_GPTQ,
+        device_map="auto",
+        trust_remote_code=True,
+    )
+    
     model.eval()
+    logger.info("  ✅ GPTQ model loaded successfully")
+    
     return model, proc
 
 
-def colpali_query_embedding(model, proc, query: str):
-    with torch.no_grad():
-        inputs = proc.process_queries([query]).to(model.device)
-        q_emb = model(**inputs)
-    return q_emb
+def load_qwen_72b_bitsandbytes() -> Tuple[any, AutoProcessor]:
+    """Fallback: Load with bitsandbytes 8-bit quantization."""
+    logger.info("Loading with bitsandbytes 8-bit quantization...")
+    
+    proc = AutoProcessor.from_pretrained(QWEN_72B_BASE)
+    
+    model = QwenModelClass.from_pretrained(
+        QWEN_72B_BASE,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        load_in_8bit=True
+    )
+    
+    # Enable gradient checkpointing to save memory
+    if hasattr(model, 'gradient_checkpointing_enable'):
+        model.gradient_checkpointing_enable()
+        logger.info("  ✅ Gradient checkpointing enabled")
+    
+    model.eval()
+    logger.info("  ✅ Bitsandbytes model loaded successfully")
+    
+    return model, proc
 
 
-def score_with_colpali(model, q_emb, page_embs: torch.Tensor) -> torch.Tensor:
+def load_qwen_72b() -> Tuple[any, AutoProcessor]:
     """
-    Preferred: use model.score if available (late-interaction scoring).
-    Fallback: mean-pool cosine (less accurate).
-    Returns tensor of scores length = num_pages.
+    Load Qwen 72B with best available quantization method.
+    Tries GPTQ first (most efficient), falls back to bitsandbytes.
     """
-    if hasattr(model, "score"):
+    logger.info("Loading Qwen2-VL-72B-Instruct...")
+    logger.info("  This may take 2-3 minutes...")
+    
+    # Try GPTQ first
+    try:
+        model, proc = load_qwen_72b_gptq()
+    except Exception as e:
+        logger.warning(f"GPTQ loading failed: {e}")
+        logger.info("Falling back to bitsandbytes quantization...")
+        
+        try:
+            model, proc = load_qwen_72b_bitsandbytes()
+        except Exception as e2:
+            logger.error(f"Bitsandbytes loading also failed: {e2}")
+            raise RuntimeError("Failed to load model with any quantization method")
+    
+    # Log memory usage
+    if torch.cuda.is_available():
+        total_allocated = 0
+        for i in range(torch.cuda.device_count()):
+            allocated = torch.cuda.memory_allocated(i) / 1e9
+            logger.info(f"     GPU {i}: {allocated:.1f} GB allocated")
+            total_allocated += allocated
+        logger.info(f"     Total VRAM: {total_allocated:.1f} GB")
+    
+    return model, proc
+
+
+# ============================================================
+# IMAGE LOADING (FIXED FOR PILLOW COMPATIBILITY)
+# ============================================================
+
+def load_image_safe(image_path: str) -> Optional[Image.Image]:
+    """
+    Load image with Pillow compatibility handling.
+    Works around Qwen processor Pillow version issues.
+    """
+    try:
+        # Load and convert to RGB
+        img = Image.open(image_path)
+        if img.mode != "RGB":
+            img = img.convert("RGB")
+        return img
+    except Exception as e:
+        logger.warning(f"Failed to load {image_path}: {e}")
+        return None
+
+
+# ============================================================
+# RAG SYNTHESIS
+# ============================================================
+
+def build_rag_prompt(query: str, book_title: str, total_pages: int, top_pages: List[dict]) -> str:
+    """Build RAG prompt with page context."""
+    
+    page_context = []
+    for i, page in enumerate(top_pages, 1):
+        ctx = f"Page {page['page_index'] + 1}:\n"
+        
+        if page.get("semantic_summary"):
+            ctx += f"  Summary: {page['semantic_summary']}\n"
+        
+        if page.get("key_terms"):
+            ctx += f"  Key terms: {', '.join(page['key_terms'][:8])}\n"
+        
+        if page.get("notable_claims"):
+            claims = page['notable_claims'][:2]
+            ctx += f"  Key points: {'; '.join(claims)}\n"
+        
+        page_context.append(ctx)
+    
+    prompt = f"""You are analyzing the book "{book_title}" ({total_pages} pages total).
+
+The user asked: "{query}"
+
+I've identified the {len(top_pages)} most relevant pages and will show you their images. Here's what I know about them:
+
+{chr(10).join(page_context)}
+
+Now look at the actual page images and provide a comprehensive answer. Your response should:
+1. Start with: "I searched the {book_title} ({total_pages} pages)..."
+2. Synthesize information from the pages to directly answer the question
+3. Reference specific pages when making claims (e.g., "Page 240 explains that...")
+4. Provide technical details and examples where relevant
+5. End with page numbers for further reading if appropriate
+
+Be thorough and technical - this is for an expert reader."""
+
+    return prompt
+
+
+def synthesize_answer(
+    model: any,
+    proc: AutoProcessor,
+    query: str,
+    top_pages: List[dict],
+    meta: dict
+) -> str:
+    """
+    Use Qwen 72B to read pages and synthesize answer.
+    """
+    logger.info(f"Synthesizing answer from top {len(top_pages)} pages...")
+    
+    # Load page images with safe loading
+    images = []
+    loaded_pages = []
+    
+    for page in top_pages:
+        img = load_image_safe(page["image_path"])
+        if img is not None:
+            images.append(img)
+            loaded_pages.append(page)
+    
+    if not images:
+        return "Error: Could not load any page images. This might be a Pillow version issue. Try: pip install Pillow --upgrade --break-system-packages"
+    
+    logger.info(f"  Loaded {len(images)}/{len(top_pages)} page images successfully")
+    
+    # Build prompt
+    prompt_text = build_rag_prompt(
+        query,
+        meta["pdf_filename"],
+        meta["page_count"],
+        loaded_pages  # Use only successfully loaded pages
+    )
+    
+    # Construct messages with multiple images
+    content = []
+    for _ in images:
+        content.append({"type": "image"})
+    content.append({"type": "text", "text": prompt_text})
+    
+    messages = [{"role": "user", "content": content}]
+    
+    # Generate
+    try:
+        prompt = proc.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True
+        )
+        
+        inputs = proc(text=prompt, images=images, return_tensors="pt")
+        
+        # Check token length before running
+        input_length = inputs["input_ids"].shape[-1]
+        if input_length > 30000:  # Conservative limit (model max is 32768)
+            logger.warning(f"Input tokens ({input_length}) very high. Reducing context...")
+            # Retry with fewer pages
+            if len(images) > 2:
+                logger.info(f"  Retrying with {len(images)-1} pages instead of {len(images)}")
+                return synthesize_answer(model, proc, query, loaded_pages[:-1], meta)
+            else:
+                return f"Error: Query context too large even with minimal pages. Try a more specific question."
+        
+        dev = next(model.parameters()).device
+        inputs = {k: v.to(dev) for k, v in inputs.items()}
+        
+        prompt_len = inputs["input_ids"].shape[-1]
+        
+        logger.info(f"  Input tokens: {prompt_len}, generating {MAX_NEW_TOKENS} tokens...")
+        logger.info("  This may take 30-60 seconds...")
+        
         with torch.no_grad():
-            scores = model.score(q_emb, page_embs.to(model.device))
-        return scores.detach().float().cpu()
+            out = model.generate(
+                **inputs,
+                max_new_tokens=MAX_NEW_TOKENS,
+                do_sample=True,
+                temperature=0.7,
+                top_p=0.9
+            )
+        
+        # Decode only generated part
+        gen_ids = out[0][prompt_len:]
+        answer = proc.decode(gen_ids, skip_special_tokens=True).strip()
+        
+        logger.info("  ✅ Answer generated")
+        
+        # CRITICAL: Clean up tensors to free GPU memory
+        del inputs
+        del out
+        del gen_ids
+        # Also clean up images
+        for img in images:
+            img.close()
+        del images
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return answer
+        
+    except torch.cuda.OutOfMemoryError as e:
+        logger.error(f"Out of memory during generation")
+        
+        # Clean up before retry
+        if 'inputs' in locals():
+            del inputs
+        if 'out' in locals():
+            del out
+        for img in images:
+            img.close()
+        del images
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        # Retry with fewer pages if possible
+        if len(loaded_pages) > 1:
+            logger.info(f"  Retrying with {len(loaded_pages)-1} pages...")
+            return synthesize_answer(model, proc, query, loaded_pages[:-1], meta)
+        else:
+            return (
+                "Error: Out of GPU memory even with 1 page. Possible fixes:\n"
+                "1. Restart the script to clear VRAM\n"
+                "2. Use GPTQ model (saves ~15GB): pip install auto-gptq\n"
+                "3. Try a shorter, more specific question"
+            )
+    except Exception as e:
+        logger.error(f"Generation failed: {e}", exc_info=True)
+        
+        # Clean up on any error
+        if 'inputs' in locals():
+            del inputs
+        if 'images' in locals():
+            for img in images:
+                try:
+                    img.close()
+                except:
+                    pass
+            del images
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        return f"Error during answer generation: {str(e)}"
 
-    # Fallback
-    q = q_emb.detach().float().cpu()
-    p = page_embs.detach().float().cpu()
-    qv = q.mean(dim=1) if q.ndim > 2 else q.mean(dim=0, keepdim=True)
-    pv = p.mean(dim=1) if p.ndim > 2 else p
-    qv = torch.nn.functional.normalize(qv, dim=-1)
-    pv = torch.nn.functional.normalize(pv, dim=-1)
-    return (pv @ qv.squeeze(0)).float()
 
+# ============================================================
+# INTERACTIVE MODE
+# ============================================================
 
-# ----------------------------
-# Merge / rerank
-# ----------------------------
-def zscore(vals: List[float]) -> List[float]:
-    if not vals:
-        return []
-    m = sum(vals) / len(vals)
-    v = sum((x - m) ** 2 for x in vals) / max(1, (len(vals) - 1))
-    s = v ** 0.5
-    if s == 0:
-        return [0.0 for _ in vals]
-    return [(x - m) / s for x in vals]
-
-
-def interactive_loop(meta: dict, page_embs: torch.Tensor):
-    print("\n✅ Retriever ready")
-    print(f"📘 Book: {meta['pdf_filename']} ({meta['page_count']} pages)")
-    print("Type 'exit' to quit.\n")
-
-    # Load ColPali once (we will use it only to rerank semantic candidates)
-    colpali_model, colpali_proc = load_colpali()
-
+def interactive_mode(semantic_records: List[dict], meta: dict):
+    """Interactive RAG Q&A loop."""
+    
+    print("\n" + "=" * 100)
+    print("📚 RAG BOOK Q&A SYSTEM")
+    print("=" * 100)
+    print(f"Book: {meta['pdf_filename']}")
+    print(f"Pages: {meta['page_count']}")
+    print(f"Indexed: {len(semantic_records)} pages")
+    print("\nAsk questions about the book content. Type 'exit' to quit.")
+    print("=" * 100)
+    
+    # Load Qwen 72B once
+    try:
+        qwen_model, qwen_proc = load_qwen_72b()
+    except Exception as e:
+        print(f"\n❌ Failed to load Qwen 72B: {e}")
+        print("\nPossible fixes:")
+        print("  1. Install auto-gptq: pip install auto-gptq --break-system-packages")
+        print("  2. Check VRAM availability (need ~36-50GB)")
+        print("  3. Ensure model is downloaded in HuggingFace cache\n")
+        return
+    
     while True:
-        query = input("Query: ").strip()
+        try:
+            query = input("\n❓ Question: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print("\n\nGoodbye!")
+            break
+        
         if not query:
             continue
+        
         if query.lower() in {"exit", "quit", "q"}:
+            print("Goodbye!")
             break
-
-        # 1) Semantic retrieve (broad)
-        sem_topk = 80          # candidates from semantic index
-        final_show = 20        # results to display
-        rerank_topn = 40       # how many of semantic candidates to rerank with ColPali
-
-        sem_hits = semantic_search(query, SEM_INDEX, top_k=sem_topk)
-
-        if not sem_hits:
-            print("\n⚠️ No semantic hits found (index may not contain those terms yet).")
-            print("Try a different query or wait for indexing to progress further.\n")
-            continue
-
-        # Keep only the book's PDF (defensive; semantic index can be multi-pdf later)
-        sem_hits = [r for r in sem_hits if r.get("pdf_filename") == meta["pdf_filename"]]
-
-        # Candidate page indices from semantic
-        cand = sem_hits[:rerank_topn]
-        cand_pages = [int(r["page_index"]) for r in cand]
-
-        # 2) ColPali rerank those candidates
-        q_emb = colpali_query_embedding(colpali_model, colpali_proc, query)
-
-        # Subset embeddings for candidates
-        cand_embs = page_embs[cand_pages]
-        col_scores = score_with_colpali(colpali_model, q_emb, cand_embs).tolist()
-
-        # Fuse: z(colpali) + z(semantic)
-        sem_scores = [float(r["_semantic_score"]) for r in cand]
-        cz = zscore(col_scores)
-        sz = zscore(sem_scores)
-
-        # Weighting: semantic-first pipeline, ColPali as reranker => give ColPali strong influence
-        alpha = 0.60  # ColPali weight in fused score over the candidate set
-        fused = [alpha * c + (1 - alpha) * s for c, s in zip(cz, sz)]
-
-        # Build fused rows
-        rows = []
-        for r, cscore, fscore in zip(cand, col_scores, fused):
-            page_i = int(r["page_index"])
-            rows.append({
-                "page_index": page_i,
-                "image_path": meta["image_paths"][page_i],
-                "fused_score": float(fscore),
-                "colpali_score": float(cscore),
-                "semantic_score": float(r["_semantic_score"]),
-                "semantic_summary": r.get("semantic_summary", "") or "",
-                "key_terms": r.get("key_terms", []) or [],
-                "notable_claims": r.get("notable_claims", []) or [],
-                "_semantic_exact": r.get("_semantic_exact", 0),
-                "_semantic_overlap": r.get("_semantic_overlap", 0),
-            })
-
-        rows.sort(key=lambda x: x["fused_score"], reverse=True)
-
-        # Print
+        
         print("\n" + "=" * 100)
-        print(f"QUERY: {query}")
-        print(f"Semantic candidates: {len(sem_hits)} (reranked top {len(rows)})")
-        print("=" * 100)
+        
+        # Stage 1: Semantic search
+        top_pages = semantic_search(query, semantic_records, top_k=TOP_K_PAGES)
+        
+        if not top_pages:
+            print("❌ No relevant pages found for this query.")
+            print("Try rephrasing or using different keywords.\n")
+            continue
+        
+        # Limit to avoid OOM
+        context_pages = top_pages[:MAX_CONTEXT_PAGES]
+        
+        print(f"\n🔍 Found {len(top_pages)} relevant pages")
+        print(f"📖 Reading top {len(context_pages)} pages: ", end="")
+        print(", ".join([str(p["page_index"] + 1) for p in context_pages]))
+        print("\n" + "-" * 100 + "\n")
+        
+        # Stage 2: Qwen 72B synthesis
+        answer = synthesize_answer(
+            qwen_model,
+            qwen_proc,
+            query,
+            context_pages,
+            meta
+        )
+        
+        print(answer)
+        print("\n" + "=" * 100)
+        
+        # CRITICAL: Clean up GPU memory after each query
+        if torch.cuda.is_available():
+            gc.collect()
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            
+            # Report memory status
+            allocated = torch.cuda.memory_allocated(0) / 1e9
+            logger.info(f"GPU memory after cleanup: {allocated:.1f} GB")
 
-        for rank, r in enumerate(rows[:final_show], start=1):
-            kt = ", ".join(r["key_terms"][:10]) if r["key_terms"] else ""
-            claim = r["notable_claims"][0] if r["notable_claims"] else ""
-            summary = r["semantic_summary"]
 
-            print(
-                f"\n#{rank:02d} page={r['page_index']:04d}  fused={r['fused_score']:+.3f}  "
-                f"colpali={r['colpali_score']:.3f}  sem={r['semantic_score']:.1f} "
-                f"(exact={r['_semantic_exact']} overlap={r['_semantic_overlap']})"
-            )
-            if summary:
-                print(f"   summary: {summary}")
-            if kt:
-                print(f"   key_terms: {kt}")
-            if claim:
-                print(f"   claim: {claim}")
-            print(f"   image: {r['image_path']}")
-
-        print("\nTip: open a page image to verify quickly (path shown above).\n")
-
+# ============================================================
+# MAIN
+# ============================================================
 
 def main():
-    meta = load_visual_metadata_single_book()
-    emb_path = Path(meta["embedding_path"])
-    page_embs = load_page_embeddings(emb_path)
-
-    interactive_loop(meta, page_embs)
+    """Main entry point."""
+    
+    print("\n" + "=" * 100)
+    print("INITIALIZING RAG SYSTEM")
+    print("=" * 100)
+    
+    # Validate
+    is_valid, errors = validate_index()
+    if not is_valid:
+        print("\n❌ INDEX VALIDATION FAILED:")
+        for error in errors:
+            print(f"  • {error}")
+        print("\nRun index_all.py first.\n")
+        return 1
+    
+    logger.info("✅ Index validation passed")
+    
+    # Load components
+    try:
+        meta = load_visual_metadata()
+        semantic_records = load_semantic_index(meta["pdf_filename"])
+        
+        # Enter interactive mode
+        interactive_mode(semantic_records, meta)
+        
+    except Exception as e:
+        logger.error(f"Failed to initialize: {e}", exc_info=True)
+        return 1
+    
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
